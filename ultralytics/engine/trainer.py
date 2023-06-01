@@ -15,6 +15,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import os
 import numpy as np
 import torch
 from torch import distributed as dist
@@ -72,7 +73,7 @@ class BaseTrainer:
         csv (Path): Path to results CSV file.
     """
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None, pipe_logger=None):
         """
         Initializes the BaseTrainer class.
 
@@ -87,6 +88,7 @@ class BaseTrainer:
         self.model = None
         self.metrics = None
         self.plots = {}
+        self.pipe_logger = pipe_logger # Logger for MlFlow and Logger
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -374,6 +376,14 @@ class BaseTrainer:
                 self.run_callbacks('on_train_batch_end')
 
             self.lr = {f'lr/pg{ir}': x['lr'] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
+            # Log lr to MLFlow
+            for lr_name, lr_value in self.lr.items():
+                self.pipe_logger.log_metric_mlflow(lr_name, lr_value, epoch)
+
+            # Log Losses to MLFlow
+            for i, loss_name in enumerate(self.loss_names):
+                loss_name = f"train/{loss_name}"
+                self.pipe_logger.log_metric_mlflow(loss_name, losses[i].item(), epoch)
 
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
@@ -389,6 +399,10 @@ class BaseTrainer:
                 if self.args.val or final_epoch:
                     self.metrics, self.fitness = self.validate()
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                # Save metrics to MLFlow
+                for metric_name, metric_value in self.metrics.items():
+                    metric_name = metric_name.replace("(", "_").replace(")", "_")
+                    self.pipe_logger.log_metric_mlflow(metric_name, metric_value, epoch)
                 self.stop = self.stopper(epoch + 1, self.fitness)
 
                 # Save model
@@ -419,6 +433,22 @@ class BaseTrainer:
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks('on_train_end')
+            # MLFlow Final Metric Logging
+            metrics = self.validator.metrics.seg
+            class_names = self.validator.names
+            metrics_to_log = ["p", "r", "f1"]
+            for i, class_name in class_names.items():
+                if class_name != "unknown":
+                    for metric in metrics_to_log:
+                        metric_name = f"cls/{class_name}/{metric}"
+                        metric_value = getattr(metrics, metric)[i-1]
+                        self.pipe_logger.log_metric_mlflow(metric_name, metric_value, epoch)
+
+            # Log all results images to MLFlow
+            for file in os.listdir(os.path.join(self.save_dir)):
+                if file.endswith(".png") or file.endswith(".jpg"):
+                    self.pipe_logger.log_artifact(os.path.join(self.save_dir, file))
+
         torch.cuda.empty_cache()
         self.run_callbacks('teardown')
 
@@ -445,8 +475,12 @@ class BaseTrainer:
         torch.save(ckpt, self.last, pickle_module=pickle)
         if self.best_fitness == self.fitness:
             torch.save(ckpt, self.best, pickle_module=pickle)
+            # Save Checkpoint and Model to MLFlow
+            self.pipe_logger.log_model_mlflow(deepcopy(de_parallel(self.model)).half(), self.args.model[:-3])
+            self.pipe_logger.log_artifact(self.best, "model_checkpoint")
         if (self.epoch > 0) and (self.save_period > 0) and (self.epoch % self.save_period == 0):
             torch.save(ckpt, self.wdir / f'epoch{self.epoch}.pt', pickle_module=pickle)
+
         del ckpt
 
     @staticmethod

@@ -55,7 +55,7 @@ class Model:
         list(ultralytics.engine.results.Results): The prediction results.
     """
 
-    def __init__(self, model: Union[str, Path] = 'yolov8n.pt', task=None) -> None:
+    def __init__(self, model: Union[str, Path] = 'yolov8n.pt', task=None, pipe_logger=None) -> None:
         """
         Initializes the YOLO model.
 
@@ -74,6 +74,7 @@ class Model:
         self.metrics = None  # validation/training metrics
         self.session = None  # HUB session
         self.task = task  # task type
+        self.pipe_logger = pipe_logger  # pipe logger for MlFlow and logger
         model = str(model).strip()  # strip spaces
 
         # Check if Ultralytics HUB model from https://hub.ultralytics.com
@@ -352,7 +353,7 @@ class Model:
             overrides['resume'] = self.ckpt_path
         self.task = overrides.get('task') or self.task
         trainer = trainer or self.smart_load('trainer')
-        self.trainer = trainer(overrides=overrides, _callbacks=self.callbacks)
+        self.trainer = TASK_MAP[self.task][1](overrides=overrides, _callbacks=self.callbacks, pipe_logger=self.pipe_logger)
         if not overrides.get('resume'):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
