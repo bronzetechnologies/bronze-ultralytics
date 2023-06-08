@@ -378,12 +378,12 @@ class BaseTrainer:
             self.lr = {f'lr/pg{ir}': x['lr'] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             # Log lr to MLFlow
             for lr_name, lr_value in self.lr.items():
-                self.pipe_logger.log_metric_mlflow(lr_name, lr_value, epoch)
+                self.pipe_logger.mlflow_client.log_metric_mlflow(lr_name, lr_value, epoch)
 
             # Log Losses to MLFlow
             for i, loss_name in enumerate(self.loss_names):
                 loss_name = f"train/{loss_name}"
-                self.pipe_logger.log_metric_mlflow(loss_name, losses[i].item(), epoch)
+                self.pipe_logger.mlflow_client.log_metric_mlflow(loss_name, losses[i].item(), epoch)
 
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
@@ -402,7 +402,7 @@ class BaseTrainer:
                 # Save metrics to MLFlow
                 for metric_name, metric_value in self.metrics.items():
                     metric_name = metric_name.replace("(", "_").replace(")", "_")
-                    self.pipe_logger.log_metric_mlflow(metric_name, metric_value, epoch)
+                    self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
                 self.stop = self.stopper(epoch + 1, self.fitness)
 
                 # Save model
@@ -442,12 +442,12 @@ class BaseTrainer:
                     for metric in metrics_to_log:
                         metric_name = f"cls/{class_name}/{metric}"
                         metric_value = getattr(metrics, metric)[i-1]
-                        self.pipe_logger.log_metric_mlflow(metric_name, metric_value, epoch)
+                        self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
 
             # Log all results images to MLFlow
             for file in os.listdir(os.path.join(self.save_dir)):
                 if file.endswith(".png") or file.endswith(".jpg"):
-                    self.pipe_logger.log_artifact(os.path.join(self.save_dir, file))
+                    self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file))
 
         torch.cuda.empty_cache()
         self.run_callbacks('teardown')
@@ -465,6 +465,32 @@ class BaseTrainer:
             'date': datetime.now().isoformat(),
             'version': __version__}
 
+        # Move everything to CPU
+        logger.info(f"Converting model to CPU for saving")
+        cpu_model = deepcopy(de_parallel(self.model)).half().cpu()
+        cpu_model.criterion.proj = cpu_model.criterion.proj.cpu()
+        cpu_model.criterion.bbox_loss = cpu_model.criterion.bbox_loss.cpu()
+        cpu_model.criterion.bce = cpu_model.criterion.bce.cpu()
+        cpu_model.criterion.stride = cpu_model.criterion.stride.cpu()
+        cpu_model.criterion.device = torch.device("cpu")
+        ema_cpu = deepcopy(self.ema.ema).half().cpu()
+        ema_cpu.criterion.proj = ema_cpu.criterion.proj.cpu()
+        ema_cpu.criterion.bbox_loss = ema_cpu.criterion.bbox_loss.cpu()
+        ema_cpu.criterion.bce = ema_cpu.criterion.bce.cpu()
+        ema_cpu.criterion.stride = ema_cpu.criterion.stride.cpu()
+        ema_cpu.criterion.device = torch.device("cpu")
+
+        # Create checkpoint for MLFlow logging in CPU
+        ckpt_cpu = {
+            'epoch': self.epoch,
+            'best_fitness': self.best_fitness,
+            'model': cpu_model,
+            'ema': ema_cpu,
+            'updates': self.ema.updates,
+            'train_args': vars(self.args),  # save as dict
+            'date': datetime.now().isoformat(),
+            'version': __version__}
+
         # Use dill (if exists) to serialize the lambda functions where pickle does not do this
         try:
             import dill as pickle
@@ -473,11 +499,13 @@ class BaseTrainer:
 
         # Save last, best and delete
         torch.save(ckpt, self.last, pickle_module=pickle)
+        self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "last")
         if self.best_fitness == self.fitness:
             torch.save(ckpt, self.best, pickle_module=pickle)
-            # Save Checkpoint and Model to MLFlow
-            self.pipe_logger.log_model_mlflow(deepcopy(de_parallel(self.model)).half(), self.args.model[:-3])
-            self.pipe_logger.log_artifact(self.best, "model_checkpoint")
+            # Log Model to MLFlow
+            self.pipe_logger.mlflow_client.log_pt_model_mlflow(ckpt, self.args.model[:-3])
+            # Save Checkpoint to MLFlow
+            self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "best")
         if (self.epoch > 0) and (self.save_period > 0) and (self.epoch % self.save_period == 0):
             torch.save(ckpt, self.wdir / f'epoch{self.epoch}.pt', pickle_module=pickle)
 
