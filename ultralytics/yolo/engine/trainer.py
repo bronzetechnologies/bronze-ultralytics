@@ -453,9 +453,12 @@ class BaseTrainer:
             logger.info(f"Logging final metrics to MLFlow")
             metrics = self.validator.metrics.seg
             class_names = self.validator.names
+            n_samples_per_class = self.validator.nt_per_class
+            # Filter class names if n_samples_per_class is 0
+            class_names = {k: v for k, v in class_names.items() if n_samples_per_class[k] != 0}
             metrics_to_log = ["p", "r", "f1"]
             metrics_str = "Final Validation Metrics: "
-            for i, class_name in class_names.items():
+            for i, class_name in enumerate(class_names.values()):
                 if class_name != "unknown":
                     for metric in metrics_to_log:
                         metric_name = f"test/{class_name}/{metric}"
