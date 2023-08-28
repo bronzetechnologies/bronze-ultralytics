@@ -180,14 +180,14 @@ class SegmentationValidator(DetectionValidator):
                     names=self.names,
                     on_plot=self.on_plot)
 
-    def plot_predictions(self, batch, preds, ni):
+    def plot_predictions(self, batch, preds, ni, epoch):
         """Plots batch predictions with masks and bounding boxes."""
         plot_images(
             batch['img'],
             *output_to_target(preds[0], max_det=15),  # not set to self.args.max_det due to slow plotting speed
             torch.cat(self.plot_masks, dim=0) if len(self.plot_masks) else self.plot_masks,
             paths=batch['im_file'],
-            fname=self.save_dir / f'val_batch{ni}_pred.jpg',
+            fname=self.save_dir / f'val_batch{ni}_epoch{epoch}_pred.jpg',
             names=self.names,
             on_plot=self.on_plot)  # pred
         self.plot_masks.clear()

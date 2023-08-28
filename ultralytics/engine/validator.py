@@ -111,6 +111,7 @@ class BaseValidator:
             self.device = trainer.device
             self.data = trainer.data
             self.args.half = self.device.type != 'cpu'  # force FP16 val during training
+            epoch = trainer.epoch
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
             # self.model = model
@@ -118,6 +119,7 @@ class BaseValidator:
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
         else:
+            epoch = None
             callbacks.add_integration_callbacks(self)
             self.run_callbacks('on_val_start')
             model = AutoBackend(model or self.args.model,
@@ -179,7 +181,10 @@ class BaseValidator:
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)
-                self.plot_predictions(batch, preds, batch_i)
+                self.plot_predictions(batch, preds, batch_i, epoch="final")
+            elif epoch is not None and (epoch % 10 == 0) and batch_i < 3:
+                self.plot_val_samples(batch, batch_i)
+                self.plot_predictions(batch, preds, batch_i, epoch=epoch)
 
             self.run_callbacks('on_val_batch_end')
         stats = self.get_stats()

@@ -422,6 +422,12 @@ class BaseTrainer:
                     self.save_model()
                     self.run_callbacks('on_model_save')
 
+                # Log all results images to MLFlow
+                logger.info(f"Logging all results images to MLFlow")
+                for file in os.listdir(os.path.join(self.save_dir)):
+                    if file.endswith(".png") or file.endswith(".jpg"):
+                        self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result images")
+
             tnow = time.time()
             self.epoch_time = tnow - self.epoch_time_start
             self.epoch_time_start = tnow
