@@ -291,10 +291,18 @@ class BaseTrainer:
                     f'Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers\n'
                     f"Logging results to {colorstr('bold', self.save_dir)}\n"
                     f'Starting training for {self.epochs} epochs...')
-        logger.info(f'Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n'
-                    f'Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers\n'
-                    f"Logging results to {colorstr('bold', self.save_dir)}\n"
-                    f'Starting training for {self.epochs} epochs...')
+
+        # Log data info to log file
+        logger.info(f"Using {self.data['path']} dataset with {self.data['nc']} classes")
+        for (class_idx, class_name) in self.data['names'].items():
+            logger.info(f"  Class: {class_idx} - {class_name}")
+        logger.info(f"Using {len(self.train_loader.dataset)} images for training")
+        logger.info(f"Using {len(self.test_loader.dataset)} images for validation")
+        logger.info(f'Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n')
+        logger.info(f"Using a batch-size of {self.batch_size} images")
+        logger.info(f'Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers')
+        logger.info(f'Starting training for {self.epochs} epochs...')
+
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
@@ -423,10 +431,11 @@ class BaseTrainer:
                     self.run_callbacks('on_model_save')
 
                 # Log all results images to MLFlow
-                logger.info(f"Logging all results images to MLFlow")
-                for file in os.listdir(os.path.join(self.save_dir)):
-                    if file.endswith(".png") or file.endswith(".jpg"):
-                        self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result images")
+                if epoch % 10 == 0:
+                    logger.info(f"Logging all results images to MLFlow")
+                    for file in os.listdir(os.path.join(self.save_dir)):
+                        if file.endswith(".png") or file.endswith(".jpg"):
+                            self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result images")
 
             tnow = time.time()
             self.epoch_time = tnow - self.epoch_time_start
@@ -454,7 +463,6 @@ class BaseTrainer:
                 self.plot_metrics()
             self.run_callbacks('on_train_end')
 
-
             # MLFlow Final Metric Logging
             logger.info(f"Logging final metrics to MLFlow")
             metrics = self.validator.metrics.seg
@@ -462,13 +470,15 @@ class BaseTrainer:
             n_samples_per_class = self.validator.nt_per_class
             # Filter class names if n_samples_per_class is 0
             class_names = {k: v for k, v in class_names.items() if n_samples_per_class[k] != 0}
+
+            # Log class metrics
             metrics_to_log = ["p", "r", "f1"]
             metrics_str = "Final Validation Metrics: "
             for i, class_name in enumerate(class_names.values()):
                 if class_name != "unknown":
                     for metric in metrics_to_log:
-                        metric_name = f"test/{class_name}/{metric}"
-                        metric_value = getattr(metrics, metric)[i-1]
+                        metric_name = f"test/{class_name}/{metric}_M"
+                        metric_value = getattr(metrics, metric)[i]
                         self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
                         metrics_str += f"{metric_name}: {metric_value:.3f} "
 
@@ -479,6 +489,12 @@ class BaseTrainer:
                 metric_value = getattr(metrics, metric)
                 self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
                 metrics_str += f"{metric_name}: {metric_value:.3f} "
+
+            # Compute F-Score Metric based on Precision and Recall
+            metric_name = f"test/all/fscore"
+            metric_value = 2 * metrics.mp * metrics.mr / (metrics.mp + metrics.mr)
+            self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+            metrics_str += f"{metric_name}: {metric_value:.3f} "
 
             # Log final metrics to log file
             logger.info(metrics_str)
