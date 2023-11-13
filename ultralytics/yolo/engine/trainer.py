@@ -435,7 +435,7 @@ class BaseTrainer:
                     logger.info(f"Logging all results images to MLFlow")
                     for file in os.listdir(os.path.join(self.save_dir)):
                         if file.endswith(".png") or file.endswith(".jpg"):
-                            self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result images")
+                            self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result artifacts")
 
             tnow = time.time()
             self.epoch_time = tnow - self.epoch_time_start
@@ -503,7 +503,7 @@ class BaseTrainer:
             logger.info(f"Logging all results images to MLFlow")
             for file in os.listdir(os.path.join(self.save_dir)):
                 if file.endswith(".png") or file.endswith(".jpg"):
-                    self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result images")
+                    self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result artifacts")
 
         torch.cuda.empty_cache()
         self.run_callbacks('teardown')
