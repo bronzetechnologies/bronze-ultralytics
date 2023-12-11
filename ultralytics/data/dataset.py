@@ -10,6 +10,8 @@ import torch
 import torchvision
 
 from ultralytics.utils import LOCAL_RANK, NUM_THREADS, TQDM, colorstr, is_dir_writeable
+from tqdm import tqdm
+from loguru import logger
 
 from .augment import Compose, Format, Instances, LetterBox, classify_albumentations, classify_transforms, v8_transforms
 from .base import BaseDataset
@@ -109,6 +111,9 @@ class YOLODataset(BaseDataset):
             TQDM(None, desc=self.prefix + d, total=n, initial=n)  # display results
             if cache['msgs']:
                 LOGGER.info('\n'.join(cache['msgs']))  # display warnings
+
+        labels_set = self.img_path.split("/")[-1]
+        logger.info(f"Labels set: {labels_set}: {nf} images, {nm + ne} backgrounds, {nc} corrupt")
 
         # Read cache
         [cache.pop(k) for k in ('hash', 'version', 'msgs')]  # remove items
