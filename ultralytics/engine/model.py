@@ -353,7 +353,7 @@ class Model:
             overrides['resume'] = self.ckpt_path
         self.task = overrides.get('task') or self.task
         trainer = trainer or self.smart_load('trainer')
-        self.trainer = TASK_MAP[self.task][1](overrides=overrides, _callbacks=self.callbacks, pipe_logger=self.pipe_logger)
+        self.trainer = trainer(overrides=overrides, _callbacks=self.callbacks, pipe_logger=self.pipe_logger)
         if not overrides.get('resume'):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
