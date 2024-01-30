@@ -587,6 +587,7 @@ class Exporter:
         f_onnx, _ = self.export_onnx()
 
         LOGGER.info(f'\n{prefix} starting export with TensorRT {trt.__version__}...')
+        LOGGER.info(f'{prefix} using Bronze AI Ultralytics code.')
         assert Path(f_onnx).exists(), f'failed to export ONNX file: {f_onnx}'
         f = self.file.with_suffix('.engine')  # TensorRT engine file
         logger = trt.Logger(trt.Logger.INFO)
@@ -631,6 +632,7 @@ class Exporter:
             meta = json.dumps(self.metadata)
             t.write(len(meta).to_bytes(4, byteorder='little', signed=True))
             t.write(meta.encode())
+            # LOGGER.info(f'{prefix} Not adding metadata to engine file.')
             # Model
             t.write(engine.serialize())
 

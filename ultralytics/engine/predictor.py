@@ -233,6 +233,12 @@ class BasePredictor:
             (self.save_dir / 'labels' if self.args.save_txt else self.save_dir).mkdir(parents=True, exist_ok=True)
 
         # Warmup model
+        # Check if self.args.model is .engine file
+        if self.args.model.endswith(".engine") and not self.done_warmup:
+            LOGGER.info("Detected Engine TensorRT model. Doing warmup with (1, 3, 384, 640) image size.")
+            self.model.warmup(imgsz=(1, 3, 384, 640))
+            self.done_warmup = True
+
         if not self.done_warmup:
             self.model.warmup(imgsz=(1 if self.model.pt or self.model.triton else self.dataset.bs, 3, *self.imgsz))
             self.done_warmup = True
