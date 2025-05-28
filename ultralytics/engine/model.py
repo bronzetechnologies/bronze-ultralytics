@@ -790,6 +790,25 @@ class Model(torch.nn.Module):
 
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):  # manually set model only if not resuming
+            overrides = self.overrides.copy()
+        if kwargs.get("cfg"):
+            LOGGER.info(f"cfg file passed. Overriding default params with {kwargs['cfg']}.")
+            # Check if it is a string
+            if isinstance(kwargs["cfg"], str):
+                overrides = YAML.load(checks.check_yaml(kwargs["cfg"]))
+            else:
+                overrides = kwargs["cfg"]
+        overrides.update(kwargs)
+        overrides['mode'] = 'train'
+        overrides['cfg'] = 'none'
+        if not overrides.get('data'):
+            raise AttributeError("Dataset required but missing, i.e. pass 'data=coco128.yaml'")
+        if overrides.get('resume'):
+            overrides['resume'] = self.ckpt_path
+        self.task = overrides.get('task') or self.task
+        trainer = trainer or self.smart_load('trainer')
+        self.trainer = trainer(overrides=overrides, _callbacks=self.callbacks)
+        if not overrides.get('resume'):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
 
