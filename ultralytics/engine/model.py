@@ -11,6 +11,7 @@ from PIL import Image
 from ultralytics.cfg import TASK2DATA, get_cfg, get_save_dir
 from ultralytics.engine.results import Results
 from ultralytics.nn.tasks import attempt_load_one_weight, guess_model_task, yaml_model_load
+from ultralytics.utils.downloads import GITHUB_ASSETS_STEMS
 from ultralytics.utils import (
     ARGV,
     ASSETS,
@@ -82,6 +83,7 @@ class Model(torch.nn.Module):
         model: Union[str, Path, "Model"] = "yolo11n.pt",
         task: str = None,
         verbose: bool = False,
+        pipe_logger = None
     ) -> None:
         """
         Initialize a new instance of the YOLO model class.
@@ -123,6 +125,7 @@ class Model(torch.nn.Module):
         self.metrics = None  # validation/training metrics
         self.session = None  # HUB session
         self.task = task  # task type
+        self.pipe_logger = pipe_logger  # pipe logger for MlFlow and logger
         self.model_name = None  # model name
         model = str(model).strip()
 
@@ -145,6 +148,10 @@ class Model(torch.nn.Module):
 
         # Load or create new YOLO model
         __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # to avoid deterministic warnings
+        suffix = Path(model).suffix
+        if not suffix and Path(model).stem in GITHUB_ASSETS_STEMS:
+            model, suffix = Path(model).with_suffix('.pt'), '.pt'  # add suffix, i.e. yolov8n -> yolov8n.pt
+
         if str(model).endswith((".yaml", ".yml")):
             self._new(model, task=task, verbose=verbose)
         else:
@@ -777,7 +784,7 @@ class Model(torch.nn.Module):
 
         checks.check_pip_update_available()
 
-        overrides = YAML.load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
+        overrides = kwargs["cfg"] if kwargs.get("cfg") else self.overrides
         custom = {
             # NOTE: handle the case when 'cfg' includes 'data'.
             "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
@@ -807,7 +814,7 @@ class Model(torch.nn.Module):
             overrides['resume'] = self.ckpt_path
         self.task = overrides.get('task') or self.task
         trainer = trainer or self.smart_load('trainer')
-        self.trainer = trainer(overrides=overrides, _callbacks=self.callbacks)
+        self.trainer = self.task_map[self.task][1](overrides=overrides, _callbacks=self.callbacks, pipe_logger=self.pipe_logger)
         if not overrides.get('resume'):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model

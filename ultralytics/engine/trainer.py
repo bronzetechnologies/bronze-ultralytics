@@ -16,6 +16,7 @@ from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import os
 import numpy as np
 import torch
 from torch import distributed as dist
@@ -107,7 +108,7 @@ class BaseTrainer:
         >>> trainer.train()
     """
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None, pipe_logger=None):
         """
         Initialize the BaseTrainer class.
 
@@ -124,6 +125,7 @@ class BaseTrainer:
         self.validator = None
         self.metrics = None
         self.plots = {}
+        self.pipe_logger = pipe_logger # Logger for MlFlow and Logger
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -449,6 +451,14 @@ class BaseTrainer:
                 self.run_callbacks("on_train_batch_end")
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
+            # Log lr to MLFlow
+            for lr_name, lr_value in self.lr.items():
+                self.pipe_logger.log_metric_mlflow(lr_name, lr_value, epoch)
+
+            # Log Losses to MLFlow
+            for i, loss_name in enumerate(self.loss_names):
+                loss_name = f"train/{loss_name}"
+                self.pipe_logger.log_metric_mlflow(loss_name, losses[i].item(), epoch)
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 final_epoch = epoch + 1 >= self.epochs
