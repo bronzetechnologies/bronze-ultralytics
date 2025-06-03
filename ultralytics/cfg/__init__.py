@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Union
+from omegaconf import OmegaConf, DictConfig
 
 from ultralytics import __version__
 from ultralytics.utils import (
@@ -237,7 +238,7 @@ CFG_BOOL_KEYS = frozenset(
 )
 
 
-def cfg2dict(cfg: Union[str, Path, Dict, SimpleNamespace]) -> Dict:
+def cfg2dict(cfg: Union[str, Path, Dict, SimpleNamespace, DictConfig]) -> Dict:
     """
     Convert a configuration object to a dictionary.
 
@@ -269,6 +270,8 @@ def cfg2dict(cfg: Union[str, Path, Dict, SimpleNamespace]) -> Dict:
         cfg = YAML.load(cfg)  # load dict
     elif isinstance(cfg, SimpleNamespace):
         cfg = vars(cfg)  # convert to dict
+    elif isinstance(cfg, DictConfig):
+        cfg = OmegaConf.to_container(cfg, resolve=True)
     return cfg
 
 
