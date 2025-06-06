@@ -472,7 +472,7 @@ class BaseTrainer:
                 # Save metrics to MLFlow
                 for metric_name, metric_value in self.metrics.items():
                     metric_name = metric_name.replace("(", "_").replace(")", "_")
-                    self.pipe_logger.log_metric_mlflow(metric_name, metric_value, epoch)
+                    self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -513,6 +513,21 @@ class BaseTrainer:
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
+            # MLFlow Final Metric LoggingAdd commentMore actions
+            metrics = self.validator.metrics.seg
+            class_names = self.validator.names
+            metrics_to_log = ["p", "r", "f1"]
+            for i, class_name in class_names.items():
+                if class_name != "unknown":
+                    for metric in metrics_to_log:
+                        metric_name = f"cls/{class_name}/{metric}"
+                        metric_value = getattr(metrics, metric)[i-1]
+                        self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+
+            # Log all results images to MLFlow
+            for file in os.listdir(os.path.join(self.save_dir)):
+                if file.endswith(".png") or file.endswith(".jpg"):
+                    self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file))
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
