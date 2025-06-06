@@ -469,6 +469,10 @@ class BaseTrainer:
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                # Save metrics to MLFlow
+                for metric_name, metric_value in self.metrics.items():
+                    metric_name = metric_name.replace("(", "_").replace(")", "_")
+                    self.pipe_logger.log_metric_mlflow(metric_name, metric_value, epoch)
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
