@@ -795,7 +795,9 @@ class Model(torch.nn.Module):
         if args.get("resume"):
             args["resume"] = self.ckpt_path
 
-        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
+        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args,
+                                                                _callbacks=self.callbacks,
+                                                                pipe_logger=self.pipe_logger)
         if not args.get("resume"):  # manually set model only if not resuming
             overrides = self.overrides.copy()
         if kwargs.get("cfg"):
