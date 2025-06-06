@@ -453,12 +453,13 @@ class BaseTrainer:
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             # Log lr to MLFlow
             for lr_name, lr_value in self.lr.items():
-                self.pipe_logger.log_metric_mlflow(lr_name, lr_value, epoch)
+                self.pipe_logger.mlflow_client.log_metric_mlflow(lr_name, lr_value, epoch)
 
-            # Log Losses to MLFlow
-            for i, loss_name in enumerate(self.loss_names):
-                loss_name = f"train/{loss_name}"
-                self.pipe_logger.log_metric_mlflow(loss_name, losses[i].item(), epoch)
+            # Log Losses to MLFlow (logged in callback)
+            # for i, loss_name in enumerate(self.loss_names):
+            #     loss_name = f"train/{loss_name}"
+            #     self.pipe_logger.mlflow_client.log_metric_mlflow(loss_name, self.loss_items[i].item(), epoch)
+
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 final_epoch = epoch + 1 >= self.epochs
