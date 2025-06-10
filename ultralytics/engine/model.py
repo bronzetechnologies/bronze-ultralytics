@@ -784,22 +784,7 @@ class Model(torch.nn.Module):
 
         checks.check_pip_update_available()
 
-        overrides = kwargs["cfg"] if kwargs.get("cfg") else self.overrides
-        custom = {
-            # NOTE: handle the case when 'cfg' includes 'data'.
-            "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
-            "model": self.overrides["model"],
-            "task": self.task,
-        }  # method defaults
-        args = {**overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
-        if args.get("resume"):
-            args["resume"] = self.ckpt_path
-
-        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args,
-                                                                _callbacks=self.callbacks,
-                                                                pipe_logger=self.pipe_logger)
-        if not args.get("resume"):  # manually set model only if not resuming
-            overrides = self.overrides.copy()
+        # Configuration overrides simplification because we use Hydra
         if kwargs.get("cfg"):
             LOGGER.info(f"cfg file passed. Overriding default params with {kwargs['cfg']}.")
             # Check if it is a string
@@ -807,17 +792,15 @@ class Model(torch.nn.Module):
                 overrides = YAML.load(checks.check_yaml(kwargs["cfg"]))
             else:
                 overrides = kwargs["cfg"]
-        overrides.update(kwargs)
-        overrides['mode'] = 'train'
-        overrides['cfg'] = 'none'
-        if not overrides.get('data'):
-            raise AttributeError("Dataset required but missing, i.e. pass 'data=coco128.yaml'")
-        if overrides.get('resume'):
-            overrides['resume'] = self.ckpt_path
-        self.task = overrides.get('task') or self.task
-        # trainer = trainer or self.smart_load('trainer') ???
-        self.trainer = self.task_map[self.task]['trainer'](overrides=overrides, _callbacks=self.callbacks, pipe_logger=self.pipe_logger)
-        if not overrides.get('resume'):  # manually set model only if not resuming
+        args = {**overrides}
+        if args.get('resume'):
+            args['resume'] = self.ckpt_path
+        args['mode'] = 'train'
+        args['cfg'] = 'none'
+
+        trainer = trainer or self._smart_load('trainer')
+        self.trainer = trainer(overrides=args, _callbacks=self.callbacks, pipe_logger=self.pipe_logger)
+        if not args.get('resume'):  # manually set model only if not resuming
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
 
