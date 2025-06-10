@@ -55,6 +55,7 @@ from ultralytics.utils.torch_utils import (
     strip_optimizer,
     torch_distributed_zero_first,
     unset_deterministic,
+    de_parallel,
 )
 
 
@@ -655,39 +656,67 @@ class BaseTrainer:
                 m.eval()
 
     def save_model(self):
-        """Save model training checkpoints with additional metadata."""
-        import io
+        """Save model checkpoints based on various conditions."""
+        ckpt = {
+            'epoch': self.epoch,
+            'best_fitness': self.best_fitness,
+            'model': deepcopy(de_parallel(self.model)).half(),
+            'ema': deepcopy(self.ema.ema).half(),
+            'updates': self.ema.updates,
+            'optimizer': self.optimizer.state_dict(),
+            'train_args': vars(self.args),  # save as dict
+            'date': datetime.now().isoformat(),
+            'version': __version__}
 
-        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
-        buffer = io.BytesIO()
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(self.ema.ema).half(),
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
-                "train_results": self.read_results_csv(),
-                "date": datetime.now().isoformat(),
-                "version": __version__,
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-            },
-            buffer,
-        )
-        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
+        # Move everything to CPU
+        logger.info(f"Converting model to CPU for saving")
+        cpu_model = deepcopy(de_parallel(self.model)).half().cpu()
+        cpu_model.criterion.proj = cpu_model.criterion.proj.cpu()
+        cpu_model.criterion.bbox_loss = cpu_model.criterion.bbox_loss.cpu()
+        cpu_model.criterion.bce = cpu_model.criterion.bce.cpu()
+        cpu_model.criterion.stride = cpu_model.criterion.stride.cpu()
+        cpu_model.criterion.device = torch.device("cpu")
+        ema_cpu = deepcopy(self.ema.ema).half().cpu()
+        ema_cpu.criterion.proj = ema_cpu.criterion.proj.cpu()
+        ema_cpu.criterion.bbox_loss = ema_cpu.criterion.bbox_loss.cpu()
+        ema_cpu.criterion.bce = ema_cpu.criterion.bce.cpu()
+        ema_cpu.criterion.stride = ema_cpu.criterion.stride.cpu()
+        ema_cpu.criterion.device = torch.device("cpu")
 
-        # Save checkpoints
-        self.last.write_bytes(serialized_ckpt)  # save last.pt
+        # Create checkpoint for MLFlow logging in CPU
+        ckpt_cpu = {
+            'epoch': self.epoch,
+            'best_fitness': self.best_fitness,
+            'model': cpu_model,
+            'ema': ema_cpu,
+            'updates': self.ema.updates,
+            'train_args': vars(self.args),  # save as dict
+            'date': datetime.now().isoformat(),
+            'version': __version__}
+
+        # Use dill (if exists) to serialize the lambda functions where pickle does not do this
+        try:
+            import dill as pickle
+        except ImportError:
+            import pickle
+
+        # Save last, best and delete
+        torch.save(ckpt, self.last, pickle_module=pickle)
+        # Log last checkpoint to MLFlow
+        logger.info(f"Logging last checkpoint to MLFlow")
+        self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "last")
         if self.best_fitness == self.fitness:
-            self.best.write_bytes(serialized_ckpt)  # save best.pt
-        if (self.save_period > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
-        # if self.args.close_mosaic and self.epoch == (self.epochs - self.args.close_mosaic - 1):
-        #    (self.wdir / "last_mosaic.pt").write_bytes(serialized_ckpt)  # save mosaic checkpoint
+            torch.save(ckpt, self.best, pickle_module=pickle)
+            # Log Model to MLFlow
+            logger.info(f"Logging model to MLFlow")
+            self.pipe_logger.mlflow_client.log_pt_model_mlflow(ckpt_cpu, self.args.model[:-3])
+            # Save Checkpoint to MLFlow
+            logger.info(f"Logging best checkpoint to MLFlow")
+            self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "best")
+        if (self.epoch > 0) and (self.save_period > 0) and (self.epoch % self.save_period == 0):
+            torch.save(ckpt, self.wdir / f'epoch{self.epoch}.pt', pickle_module=pickle)
+
+        del ckpt
 
     def get_dataset(self):
         """
