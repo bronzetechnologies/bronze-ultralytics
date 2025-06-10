@@ -149,12 +149,14 @@ class BaseValidator:
             self.data = trainer.data
             # Force FP16 val during training
             self.args.half = self.device.type != "cpu" and trainer.amp
+            epoch = trainer.epoch
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
             self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
-            self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            self.args.plots = trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
         else:
+            epoch = None
             if str(self.args.model).endswith(".yaml") and model is None:
                 LOGGER.warning("validating an untrained model YAML will result in 0 mAP.")
             callbacks.add_integration_callbacks(self)
@@ -225,7 +227,10 @@ class BaseValidator:
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:
                 self.plot_val_samples(batch, batch_i)
-                self.plot_predictions(batch, preds, batch_i)
+                self.plot_predictions(batch, preds, batch_i, epoch="final")
+            elif epoch is not None and (epoch % 10 == 0) and batch_i < 3:
+                self.plot_val_samples(batch, batch_i)
+                self.plot_predictions(batch, preds, batch_i, epoch=epoch)
 
             self.run_callbacks("on_val_batch_end")
         stats = self.get_stats()
