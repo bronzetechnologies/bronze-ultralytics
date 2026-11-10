@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-__version__ = "8.3.146"
+__version__ = "8.3.146.post1"
 
 import os
 
@@ -15,15 +15,15 @@ from ultralytics.utils.downloads import download
 
 settings = SETTINGS
 __all__ = (
-    "__version__",
     "ASSETS",
-    "YOLO",
-    "YOLOWorld",
-    "YOLOE",
     "NAS",
-    "SAM",
-    "FastSAM",
     "RTDETR",
+    "SAM",
+    "YOLO",
+    "YOLOE",
+    "FastSAM",
+    "YOLOWorld",
+    "__version__",
     "checks",
     "download",
     "settings",

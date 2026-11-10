@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from loguru import logger
 from torch import distributed as dist
 from torch import nn, optim
 
@@ -46,7 +47,7 @@ from ultralytics.utils.torch_utils import (
     EarlyStopping,
     ModelEMA,
     autocast,
-    convert_optimizer_state_dict_to_fp16,
+    de_parallel,
     init_seeds,
     one_cycle,
     select_device,
@@ -57,8 +58,7 @@ from ultralytics.utils.torch_utils import (
 
 
 class BaseTrainer:
-    """
-    A base class for creating trainers.
+    """A base class for creating trainers.
 
     This class provides the foundation for training YOLO models, handling the training loop, validation, checkpointing,
     and various training utilities. It supports both single-GPU and multi-GPU distributed training.
@@ -107,9 +107,8 @@ class BaseTrainer:
         >>> trainer.train()
     """
 
-    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None):
-        """
-        Initialize the BaseTrainer class.
+    def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks=None, pipe_logger=None):
+        """Initialize the BaseTrainer class.
 
         Args:
             cfg (str, optional): Path to a configuration file.
@@ -124,6 +123,7 @@ class BaseTrainer:
         self.validator = None
         self.metrics = None
         self.plots = {}
+        self.pipe_logger = pipe_logger  # Logger for MlFlow and Logger
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -218,8 +218,8 @@ class BaseTrainer:
             try:
                 LOGGER.info(f"{colorstr('DDP:')} debug command {' '.join(cmd)}")
                 subprocess.run(cmd, check=True)
-            except Exception as e:
-                raise e
+            except Exception:
+                raise
             finally:
                 ddp_cleanup(self, str(file))
 
@@ -360,6 +360,18 @@ class BaseTrainer:
             f"Logging results to {colorstr('bold', self.save_dir)}\n"
             f"Starting training for " + (f"{self.args.time} hours..." if self.args.time else f"{self.epochs} epochs...")
         )
+
+        # Log data info to log file
+        logger.info(f"Using {self.data['path']} dataset with {self.data['nc']} classes")
+        for class_idx, class_name in self.data["names"].items():
+            logger.info(f"  Class: {class_idx} - {class_name}")
+        logger.info(f"Using {len(self.train_loader.dataset)} images for training")
+        logger.info(f"Using {len(self.test_loader.dataset)} images for validation")
+        logger.info(f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n")
+        logger.info(f"Using a batch-size of {self.batch_size} images")
+        logger.info(f"Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers")
+        logger.info(f"Starting training for {self.epochs} epochs...")
+
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
@@ -430,6 +442,9 @@ class BaseTrainer:
                             break
 
                 # Log
+                mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"  # (GB)
+                loss_len = self.tloss.shape[0] if len(self.tloss.size()) else 1
+                losses = self.tloss if loss_len > 1 else torch.unsqueeze(self.tloss, 0)
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
                     pbar.set_description(
@@ -448,7 +463,22 @@ class BaseTrainer:
 
                 self.run_callbacks("on_train_batch_end")
 
+                # Log to Loguru
+                loss_str = "Losses: "
+                for k, loss_name in enumerate(self.loss_names):
+                    loss_str += f"{loss_name}: {losses[k]:.2f} "
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}. Train Batch {i}/{len(pbar)}. GPU Mem {mem}. {loss_str}.")
+
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
+            # Log lr to MLFlow
+            # for lr_name, lr_value in self.lr.items():
+            #     self.pipe_logger.mlflow_client.log_metric_mlflow(lr_name, lr_value, epoch)
+
+            # Log Losses to MLFlow (logged in callback)
+            # for i, loss_name in enumerate(self.loss_names):
+            #     loss_name = f"train/{loss_name}"
+            #     self.pipe_logger.mlflow_client.log_metric_mlflow(loss_name, self.loss_items[i].item(), epoch)
+
             self.run_callbacks("on_train_epoch_end")
             if RANK in {-1, 0}:
                 final_epoch = epoch + 1 >= self.epochs
@@ -458,6 +488,38 @@ class BaseTrainer:
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+
+                # Compute F-Score Metric based on Precision and Recall
+                if self.metrics["metrics/precision(B)"] + self.metrics["metrics/recall(B)"] != 0:
+                    self.metrics["metrics/fscore(B)"] = (
+                        2
+                        * self.metrics["metrics/precision(B)"]
+                        * self.metrics["metrics/recall(B)"]
+                        / (self.metrics["metrics/precision(B)"] + self.metrics["metrics/recall(B)"])
+                    )
+                else:
+                    self.metrics["metrics/fscore(B)"] = 0.0
+                if self.metrics["metrics/precision(M)"] + self.metrics["metrics/recall(M)"] != 0:
+                    self.metrics["metrics/fscore(M)"] = (
+                        2
+                        * self.metrics["metrics/precision(M)"]
+                        * self.metrics["metrics/recall(M)"]
+                        / (self.metrics["metrics/precision(M)"] + self.metrics["metrics/recall(M)"])
+                    )
+                else:
+                    self.metrics["metrics/fscore(M)"] = 0.0
+
+                # Save metrics to log
+                metrics_str = "Metrics: "
+                for metric_name, metric_value in self.metrics.items():
+                    metrics_str += f"{metric_name}: {metric_value:.3f} "
+                logger.info(f"Epoch {epoch + 1}/{self.epochs}. Validation. {metrics_str}.")
+
+                # Save metrics to MLFlow
+                for metric_name, metric_value in self.metrics.items():
+                    metric_name = metric_name.replace("(", "_").replace(")", "_")
+                    metric_name = metric_name.replace("metrics", "val")
+                    self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -466,6 +528,15 @@ class BaseTrainer:
                 if self.args.save or final_epoch:
                     self.save_model()
                     self.run_callbacks("on_model_save")
+
+                # Log all results images to MLFlow
+                if epoch % 10 == 0:
+                    logger.info("Logging all results images to MLFlow")
+                    for file in os.listdir(os.path.join(self.save_dir)):
+                        if file.endswith((".png", ".jpg")):
+                            self.pipe_logger.mlflow_client.log_artifact(
+                                os.path.join(self.save_dir, file), "result artifacts"
+                            )
 
             # Scheduler
             t = time.time()
@@ -498,6 +569,47 @@ class BaseTrainer:
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
+
+            # MLFlow Final Metric Logging
+            metrics = self.validator.metrics.seg
+            class_names = self.validator.names
+            n_samples_per_class = self.validator.nt_per_class
+            # Filter class names if n_samples_per_class is 0
+            class_names = {k: v for k, v in class_names.items() if n_samples_per_class[k] != 0}
+
+            # Log class metrics
+            metrics_to_log = ["p", "r", "f1"]
+            metrics_str = "Final Validation Metrics: "
+            for i, class_name in enumerate(class_names.values()):
+                if class_name != "unknown":
+                    for metric in metrics_to_log:
+                        metric_name = f"test/{class_name}/{metric}_M"
+                        metric_value = getattr(metrics, metric)[i]
+                        self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+                        metrics_str += f"{metric_name}: {metric_value:.3f} "
+
+            # Log all class metrics
+            metrics_to_log = ["mp", "mr"]
+            for metric in metrics_to_log:
+                metric_name = f"test/all/{metric}"
+                metric_value = getattr(metrics, metric)
+                self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+                metrics_str += f"{metric_name}: {metric_value:.3f} "
+
+            # Compute F-Score Metric based on Precision and Recall
+            metric_name = "test/all/fscore"
+            metric_value = 2 * metrics.mp * metrics.mr / (metrics.mp + metrics.mr)
+            self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+            metrics_str += f"{metric_name}: {metric_value:.3f} "
+
+            # Log final metrics to log file
+            logger.info(metrics_str)
+
+            # Log all results images to MLFlow
+            logger.info("Logging all results images to MLFlow")
+            for file in os.listdir(os.path.join(self.save_dir)):
+                if file.endswith((".png", ".jpg")):
+                    self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result artifacts")
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
@@ -550,43 +662,69 @@ class BaseTrainer:
                 m.eval()
 
     def save_model(self):
-        """Save model training checkpoints with additional metadata."""
-        import io
+        """Save model checkpoints based on various conditions."""
+        ckpt = {
+            "epoch": self.epoch,
+            "best_fitness": self.best_fitness,
+            "model": deepcopy(de_parallel(self.model)).half(),
+            "ema": deepcopy(self.ema.ema).half(),
+            "updates": self.ema.updates,
+            "optimizer": self.optimizer.state_dict(),
+            "train_args": vars(self.args),  # save as dict
+            "date": datetime.now().isoformat(),
+            "version": __version__,
+        }
 
-        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
-        buffer = io.BytesIO()
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(self.ema.ema).half(),
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
-                "train_results": self.read_results_csv(),
-                "date": datetime.now().isoformat(),
-                "version": __version__,
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-            },
-            buffer,
-        )
-        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
+        # Move everything to CPU
+        logger.info("Converting model to CPU for saving")
+        cpu_model = deepcopy(de_parallel(self.model)).half().cpu()
+        cpu_model.criterion.proj = cpu_model.criterion.proj.cpu()
+        cpu_model.criterion.bbox_loss = cpu_model.criterion.bbox_loss.cpu()
+        cpu_model.criterion.bce = cpu_model.criterion.bce.cpu()
+        cpu_model.criterion.stride = cpu_model.criterion.stride.cpu()
+        cpu_model.criterion.device = torch.device("cpu")
+        ema_cpu = deepcopy(self.ema.ema).half().cpu()
+        ema_cpu.criterion.proj = ema_cpu.criterion.proj.cpu()
+        ema_cpu.criterion.bbox_loss = ema_cpu.criterion.bbox_loss.cpu()
+        ema_cpu.criterion.bce = ema_cpu.criterion.bce.cpu()
+        ema_cpu.criterion.stride = ema_cpu.criterion.stride.cpu()
+        ema_cpu.criterion.device = torch.device("cpu")
 
-        # Save checkpoints
-        self.last.write_bytes(serialized_ckpt)  # save last.pt
+        # Create checkpoint for MLFlow logging in CPU
+        ckpt_cpu = {
+            "epoch": self.epoch,
+            "best_fitness": self.best_fitness,
+            "model": cpu_model,
+            "ema": ema_cpu,
+            "updates": self.ema.updates,
+            "train_args": vars(self.args),  # save as dict
+            "date": datetime.now().isoformat(),
+            "version": __version__,
+        }
+
+        # Use dill (if exists) to serialize the lambda functions where pickle does not do this
+        try:
+            import dill as pickle
+        except ImportError:
+            import pickle
+
+        # Save last, best and delete
+        torch.save(ckpt, self.last, pickle_module=pickle)
         if self.best_fitness == self.fitness:
-            self.best.write_bytes(serialized_ckpt)  # save best.pt
-        if (self.save_period > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
-        # if self.args.close_mosaic and self.epoch == (self.epochs - self.args.close_mosaic - 1):
-        #    (self.wdir / "last_mosaic.pt").write_bytes(serialized_ckpt)  # save mosaic checkpoint
+            torch.save(ckpt, self.best, pickle_module=pickle)
+            # Log Model to MLFlow
+            logger.info("Logging model to MLFlow")
+            self.pipe_logger.mlflow_client.log_pt_model_mlflow(ckpt_cpu, self.args.model[:-3])
+            # Save Checkpoint to MLFlow
+            logger.info("Logging best checkpoint to MLFlow")
+            self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "best")
+        if (self.epoch > 0) and (self.save_period > 0) and (self.epoch % self.save_period == 0):
+            torch.save(ckpt, self.wdir / f"epoch{self.epoch}.pt", pickle_module=pickle)
+
+        del ckpt
 
     def get_dataset(self):
-        """
-        Get train and validation datasets from data dictionary.
+        """Get train and validation datasets from data dictionary.
 
         Returns:
             (dict): A dictionary containing the training/validation/test dataset and category names.
@@ -612,8 +750,7 @@ class BaseTrainer:
         return data
 
     def setup_model(self):
-        """
-        Load, create, or download model for any task.
+        """Load, create, or download model for any task.
 
         Returns:
             (dict): Optional checkpoint to resume training from.
@@ -646,8 +783,7 @@ class BaseTrainer:
         return batch
 
     def validate(self):
-        """
-        Run validation on test set using self.validator.
+        """Run validation on test set using self.validator.
 
         Returns:
             metrics (dict): Dictionary of validation metrics.
@@ -676,10 +812,9 @@ class BaseTrainer:
         raise NotImplementedError("build_dataset function not implemented in trainer")
 
     def label_loss_items(self, loss_items=None, prefix="train"):
-        """
-        Return a loss dict with labelled training loss items tensor.
+        """Return a loss dict with labeled training loss items tensor.
 
-        Note:
+        Notes:
             This is not needed for classification but necessary for segmentation & detection
         """
         return {"loss": loss_items} if loss_items is not None else ["loss"]
@@ -690,7 +825,6 @@ class BaseTrainer:
 
     def build_targets(self, preds, targets):
         """Build target tensors for training YOLO model."""
-        pass
 
     def progress_string(self):
         """Return a string describing training progress."""
@@ -699,24 +833,21 @@ class BaseTrainer:
     # TODO: may need to put these following functions into callback
     def plot_training_samples(self, batch, ni):
         """Plot training samples during YOLO training."""
-        pass
 
     def plot_training_labels(self):
         """Plot training labels for YOLO model."""
-        pass
 
     def save_metrics(self, metrics):
         """Save training metrics to a CSV file."""
         keys, vals = list(metrics.keys()), list(metrics.values())
         n = len(metrics) + 2  # number of cols
-        s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # header
+        s = "" if self.csv.exists() else (("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n")  # header
         t = time.time() - self.train_time_start
         with open(self.csv, "a", encoding="utf-8") as f:
-            f.write(s + ("%.6g," * n % tuple([self.epoch + 1, t] + vals)).rstrip(",") + "\n")
+            f.write(s + ("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
 
     def plot_metrics(self):
         """Plot and display metrics visually."""
-        pass
 
     def on_plot(self, name, data=None):
         """Register plots (e.g. to be consumed in callbacks)."""
@@ -807,18 +938,16 @@ class BaseTrainer:
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
-        """
-        Construct an optimizer for the given model.
+        """Construct an optimizer for the given model.
 
         Args:
             model (torch.nn.Module): The model for which to build an optimizer.
-            name (str, optional): The name of the optimizer to use. If 'auto', the optimizer is selected
-                based on the number of iterations.
+            name (str, optional): The name of the optimizer to use. If 'auto', the optimizer is selected based on the
+                number of iterations.
             lr (float, optional): The learning rate for the optimizer.
             momentum (float, optional): The momentum factor for the optimizer.
             decay (float, optional): The weight decay for the optimizer.
-            iterations (float, optional): The number of iterations, which determines the optimizer if
-                name is 'auto'.
+            iterations (float, optional): The number of iterations, which determines the optimizer if name is 'auto'.
 
         Returns:
             (torch.optim.Optimizer): The constructed optimizer.
