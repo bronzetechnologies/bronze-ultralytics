@@ -702,9 +702,6 @@ class BaseTrainer:
 
         # Save last, best and delete
         torch.save(ckpt, self.last, pickle_module=pickle)
-        # Log last checkpoint to MLFlow
-        logger.info(f"Logging last checkpoint to MLFlow")
-        self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "last")
         if self.best_fitness == self.fitness:
             torch.save(ckpt, self.best, pickle_module=pickle)
             # Log Model to MLFlow
