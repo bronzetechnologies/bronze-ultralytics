@@ -218,3 +218,23 @@ def test_pending_best_without_client_raises():
     t._pending_best_ckpt = ("ckpt", "yolo")
     with pytest.raises(RuntimeError):
         t._ensure_best_model_uploaded()
+
+
+def test_reset_best_effort_clears_client_and_fallback_cooldown():
+    class C:
+        reset = 0
+
+        def reset_best_effort_cooldown(self):
+            C.reset += 1
+
+    t = make_trainer(C())
+    t._mlflow_skip_until = 1e18
+    cb._reset_best_effort(t)
+    assert C.reset == 1 and t._mlflow_skip_until == 0.0
+
+    t2 = make_trainer(None)
+    t2._mlflow_skip_until = 1e18
+    cb._reset_best_effort(t2)
+    calls = []
+    assert cb._best_effort(t2, "x", lambda: calls.append(1))
+    assert calls == [1]
