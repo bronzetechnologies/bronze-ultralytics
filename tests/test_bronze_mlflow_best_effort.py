@@ -211,3 +211,10 @@ def test_failed_result_image_retried(tmp_path):
     t._log_new_result_images()
     assert t._uploaded_result_images == {"a.png"}
     assert len(client.artifact_calls) == 1
+
+
+def test_pending_best_without_client_raises():
+    t = make_trainer(None)
+    t._pending_best_ckpt = ("ckpt", "yolo")
+    with pytest.raises(RuntimeError):
+        t._ensure_best_model_uploaded()

@@ -683,7 +683,7 @@ class BaseTrainer:
             return
         client = _mlflow_client(self)
         if client is None:
-            return
+            raise RuntimeError("No MLFlow client (pipe_logger.mlflow_client): the best model was never uploaded")
         ckpt_cpu, backbone = pending
         logger.info("Re-uploading the best model to MLFlow")
         _fatal(self, "upload best model", client.log_pt_model_mlflow, ckpt_cpu, backbone)
@@ -740,9 +740,12 @@ class BaseTrainer:
             torch.save(ckpt, self.best, pickle_module=pickle)
             # Log Model to MLFlow
             client = _mlflow_client(self)
-            if client is not None:
+            backbone = self.args.model[:-3]
+            if client is None:
+                # Without a client the registered model cannot be uploaded: _ensure_best_model_uploaded raises.
+                self._pending_best_ckpt = (ckpt_cpu, backbone)
+            else:
                 logger.info(f"Logging model to MLFlow")
-                backbone = self.args.model[:-3]
                 if _best_effort(self, "upload best model", client.log_pt_model_mlflow, ckpt_cpu, backbone):
                     self._pending_best_ckpt = None
                 else:
