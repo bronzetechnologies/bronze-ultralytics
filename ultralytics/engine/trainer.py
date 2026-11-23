@@ -42,7 +42,13 @@ from ultralytics.utils import (
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.callbacks import mlflow as _mlflow_cb
-from ultralytics.utils.callbacks.mlflow import RESULT_ARTIFACTS_DIR, _best_effort, _fatal, _mlflow_client
+from ultralytics.utils.callbacks.mlflow import (
+    RESULT_ARTIFACTS_DIR,
+    _best_effort,
+    _fatal,
+    _mlflow_client,
+    _reset_best_effort,
+)
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.torch_utils import (
@@ -558,6 +564,7 @@ class BaseTrainer:
             epoch += 1
 
         if RANK in {-1, 0}:
+            _reset_best_effort(self)  # an outage during the epochs must not skip the end-of-training uploads
             self._ensure_best_model_uploaded()  # fatal if the last best model never reached MLflow
             # Do final val with best.pt
             seconds = time.time() - self.train_time_start

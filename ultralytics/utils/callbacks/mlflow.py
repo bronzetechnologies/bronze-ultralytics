@@ -27,7 +27,7 @@ from ultralytics.utils import LOGGER, RUNS_DIR, SETTINGS, TESTS_RUNNING, colorst
 RESULT_ARTIFACTS_DIR = "result artifacts"
 
 # Bronze: an MLflow outage must not kill a long training. Helpers shared with engine/trainer.py.
-BEST_EFFORT_COOLDOWN_S = 600
+BEST_EFFORT_COOLDOWN_S = 180
 FATAL_PATIENCE_S = 1800
 FATAL_SLEEP_S = 60
 _PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError)
@@ -70,6 +70,14 @@ def _best_effort(trainer, what, fn, *args, **kwargs) -> bool:
             os.environ.pop(key, None)
         else:
             os.environ[key] = old
+
+
+def _reset_best_effort(trainer):
+    """End the best-effort cooldown when the epochs end, so the end-of-training uploads are tried at least once."""
+    client = _mlflow_client(trainer)
+    if client is not None and hasattr(client, "reset_best_effort_cooldown"):
+        client.reset_best_effort_cooldown()
+    trainer._mlflow_skip_until = 0.0
 
 
 def _fatal(trainer, what, fn, *args, **kwargs):
