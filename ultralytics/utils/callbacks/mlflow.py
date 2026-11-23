@@ -26,6 +26,72 @@ from ultralytics.utils import LOGGER, RUNS_DIR, SETTINGS, TESTS_RUNNING, colorst
 # Bronze: every save_dir result file goes to this run folder, not to the run root
 RESULT_ARTIFACTS_DIR = "result artifacts"
 
+# Bronze: an MLflow outage must not kill a long training. Helpers shared with engine/trainer.py.
+BEST_EFFORT_COOLDOWN_S = 600
+FATAL_PATIENCE_S = 1800
+FATAL_SLEEP_S = 60
+_PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError)
+
+
+def _mlflow_client(trainer):
+    """Return the duck-typed Bronze MLflow client of the trainer, or None."""
+    return getattr(getattr(trainer, "pipe_logger", None), "mlflow_client", None)
+
+
+def _best_effort(trainer, what, fn, *args, **kwargs) -> bool:
+    """Run fn(*args, **kwargs) without ever raising on an MLflow outage. Return True on success."""
+    import os
+    import time
+
+    client = _mlflow_client(trainer)
+    if client is not None and hasattr(client, "best_effort"):
+        return client.best_effort(what, fn, *args, **kwargs)
+    # Fallback: minimal local circuit breaker
+    now = time.monotonic()
+    skip_until = getattr(trainer, "_mlflow_skip_until", 0.0)
+    if now < skip_until:
+        trainer._mlflow_best_effort_skipped = getattr(trainer, "_mlflow_best_effort_skipped", 0) + 1
+        return False
+    key = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
+    old = os.environ.get(key)
+    os.environ[key] = "2"
+    try:
+        fn(*args, **kwargs)
+        return True
+    except _PROGRAMMING_ERRORS:
+        raise
+    except Exception as e:
+        trainer._mlflow_best_effort_failures = getattr(trainer, "_mlflow_best_effort_failures", 0) + 1
+        trainer._mlflow_skip_until = time.monotonic() + BEST_EFFORT_COOLDOWN_S
+        LOGGER.warning(f"MLflow: {what} failed, training continues ({type(e).__name__}: {e})")
+        return False
+    finally:
+        if old is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = old
+
+
+def _fatal(trainer, what, fn, *args, **kwargs):
+    """Run fn(*args, **kwargs), retrying for up to FATAL_PATIENCE_S, then raise."""
+    import time
+
+    client = _mlflow_client(trainer)
+    if client is not None and hasattr(client, "fatal_with_patience"):
+        return client.fatal_with_patience(what, fn, *args, **kwargs)
+    deadline = time.monotonic() + FATAL_PATIENCE_S
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except _PROGRAMMING_ERRORS:
+            raise
+        except Exception as e:
+            if time.monotonic() >= deadline:
+                raise
+            LOGGER.warning(f"MLflow: {what} failed, retrying in {FATAL_SLEEP_S}s ({type(e).__name__}: {e})")
+            time.sleep(FATAL_SLEEP_S)
+
+
 try:
     import os
 
@@ -91,29 +157,51 @@ def on_pretrain_routine_end(trainer):
 def on_train_epoch_end(trainer):
     """Log training metrics at the end of each train epoch to MLflow."""
     if mlflow:
-        mlflow.log_metrics(
-            metrics={
-                **sanitize_dict(trainer.lr),
-                **sanitize_dict(trainer.label_loss_items(trainer.tloss, prefix="train")),
-            },
-            step=trainer.epoch,
+        _best_effort(
+            trainer,
+            "train epoch metrics",
+            lambda: mlflow.log_metrics(
+                metrics={
+                    **sanitize_dict(trainer.lr),
+                    **sanitize_dict(trainer.label_loss_items(trainer.tloss, prefix="train")),
+                },
+                step=trainer.epoch,
+            ),
         )
 
 
 def on_fit_epoch_end(trainer):
     """Log training metrics at the end of each fit epoch to MLflow."""
     if mlflow:
-        mlflow.log_metrics(metrics=sanitize_dict(trainer.metrics), step=trainer.epoch)
+        _best_effort(
+            trainer,
+            "fit epoch metrics",
+            lambda: mlflow.log_metrics(metrics=sanitize_dict(trainer.metrics), step=trainer.epoch),
+        )
 
 
 def on_train_end(trainer):
     """Log model artifacts at the end of training."""
     if not mlflow:
         return
-    mlflow.log_artifact(str(trainer.best.parent))  # log save_dir/weights directory with best.pt and last.pt
+    # Bronze: best.pt is fatal (retried with patience); last.pt and other files are best-effort.
+    # Same artifact paths as logging the whole weights/ directory: weights/<file>
+    weights_dir = trainer.best.parent
+    best_name = Path(trainer.best).name
+    for f in sorted(weights_dir.glob("*")):
+        if not f.is_file():
+            continue
+        if f.name == best_name:
+            _fatal(trainer, f"upload weights/{f.name}", mlflow.log_artifact, str(f), weights_dir.name)
+        else:
+            _best_effort(trainer, f"upload weights/{f.name}", mlflow.log_artifact, str(f), weights_dir.name)
     for f in trainer.save_dir.glob("*"):  # log all other files in save_dir, in one folder (Bronze)
         if f.suffix in {".png", ".jpg", ".csv", ".pt", ".yaml"}:
-            mlflow.log_artifact(str(f), RESULT_ARTIFACTS_DIR)
+            _best_effort(trainer, f"upload {f.name}", mlflow.log_artifact, str(f), RESULT_ARTIFACTS_DIR)
+    if _mlflow_client(trainer) is None:
+        n = getattr(trainer, "_mlflow_best_effort_failures", 0)
+        k = getattr(trainer, "_mlflow_best_effort_skipped", 0)
+        LOGGER.info(f"{PREFIX}best-effort MLflow calls failed: {n}, skipped during cooldown: {k}")
     keep_run_active = os.environ.get("MLFLOW_KEEP_RUN_ACTIVE", "False").lower() == "true"
     if keep_run_active:
         LOGGER.info(f"{PREFIX}mlflow run still alive, remember to close it using mlflow.end_run()")
