@@ -41,6 +41,7 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
+from ultralytics.utils.callbacks.mlflow import RESULT_ARTIFACTS_DIR
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.torch_utils import (
@@ -525,12 +526,9 @@ class BaseTrainer:
                     self.save_model()
                     self.run_callbacks("on_model_save")
                 
-                # Log all results images to MLFlow
+                # Log new results images to MLFlow (the full save_dir goes up once at on_train_end)
                 if epoch % 10 == 0:
-                    logger.info(f"Logging all results images to MLFlow")
-                    for file in os.listdir(os.path.join(self.save_dir)):
-                        if file.endswith(".png") or file.endswith(".jpg"):
-                            self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result artifacts")
+                    self._log_new_result_images()
 
             # Scheduler
             t = time.time()
@@ -598,12 +596,6 @@ class BaseTrainer:
 
             # Log final metrics to log file
             logger.info(metrics_str)
-
-            # Log all results images to MLFlow
-            logger.info(f"Logging all results images to MLFlow")
-            for file in os.listdir(os.path.join(self.save_dir)):
-                if file.endswith(".png") or file.endswith(".jpg"):
-                    self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), "result artifacts")
         self._clear_memory()
         unset_deterministic()
         self.run_callbacks("teardown")
@@ -654,6 +646,17 @@ class BaseTrainer:
         for n, m in self.model.named_modules():
             if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
                 m.eval()
+
+    def _log_new_result_images(self):
+        """Upload to MLFlow 'result artifacts' the save_dir images not uploaded yet in this run."""
+        uploaded = self.__dict__.setdefault("_uploaded_result_images", set())
+        new_files = sorted(
+            f for f in os.listdir(self.save_dir) if f.endswith((".png", ".jpg")) and f not in uploaded
+        )
+        logger.info(f"Logging {len(new_files)} new results images to MLFlow")
+        for file in new_files:
+            self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), RESULT_ARTIFACTS_DIR)
+            uploaded.add(file)
 
     def save_model(self):
         """Save model checkpoints based on various conditions."""

@@ -23,6 +23,9 @@ Commands:
 
 from ultralytics.utils import LOGGER, RUNS_DIR, SETTINGS, TESTS_RUNNING, colorstr
 
+# Bronze: every save_dir result file goes to this run folder, not to the run root
+RESULT_ARTIFACTS_DIR = "result artifacts"
+
 try:
     import os
 
@@ -108,9 +111,9 @@ def on_train_end(trainer):
     if not mlflow:
         return
     mlflow.log_artifact(str(trainer.best.parent))  # log save_dir/weights directory with best.pt and last.pt
-    for f in trainer.save_dir.glob("*"):  # log all other files in save_dir
+    for f in trainer.save_dir.glob("*"):  # log all other files in save_dir, in one folder (Bronze)
         if f.suffix in {".png", ".jpg", ".csv", ".pt", ".yaml"}:
-            mlflow.log_artifact(str(f))
+            mlflow.log_artifact(str(f), RESULT_ARTIFACTS_DIR)
     keep_run_active = os.environ.get("MLFLOW_KEEP_RUN_ACTIVE", "False").lower() == "true"
     if keep_run_active:
         LOGGER.info(f"{PREFIX}mlflow run still alive, remember to close it using mlflow.end_run()")
