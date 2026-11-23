@@ -41,7 +41,8 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
-from ultralytics.utils.callbacks.mlflow import RESULT_ARTIFACTS_DIR
+from ultralytics.utils.callbacks import mlflow as _mlflow_cb
+from ultralytics.utils.callbacks.mlflow import RESULT_ARTIFACTS_DIR, _best_effort, _fatal, _mlflow_client
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.torch_utils import (
@@ -129,6 +130,7 @@ class BaseTrainer:
         self.metrics = None
         self.plots = {}
         self.pipe_logger = pipe_logger # Logger for MlFlow and Logger
+        self._pending_best_ckpt = None  # (ckpt_cpu, backbone) of a best model whose MLflow upload failed
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -513,10 +515,12 @@ class BaseTrainer:
                 logger.info(f'Epoch {epoch + 1}/{self.epochs}. Validation. {metrics_str}.')
 
                 # Save metrics to MLFlow
+                val_metrics = {}
                 for metric_name, metric_value in self.metrics.items():
                     metric_name = metric_name.replace("(", "_").replace(")", "_")
                     metric_name = metric_name.replace("metrics", "val")
-                    self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+                    val_metrics[metric_name] = float(metric_value)
+                self._log_metrics_best_effort("val metrics", val_metrics, epoch)
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -554,6 +558,7 @@ class BaseTrainer:
             epoch += 1
 
         if RANK in {-1, 0}:
+            self._ensure_best_model_uploaded()  # fatal if the last best model never reached MLflow
             # Do final val with best.pt
             seconds = time.time() - self.train_time_start
             LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
@@ -572,12 +577,13 @@ class BaseTrainer:
             # Log class metrics
             metrics_to_log = ["p", "r", "f1"]
             metrics_str = "Final Validation Metrics: "
+            test_metrics = {}
             for i, class_name in enumerate(class_names.values()):
                 if class_name != "unknown":
                     for metric in metrics_to_log:
                         metric_name = f"test/{class_name}/{metric}_M"
                         metric_value = getattr(metrics, metric)[i]
-                        self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+                        test_metrics[metric_name] = float(metric_value)
                         metrics_str += f"{metric_name}: {metric_value:.3f} "
 
             # Log all class metrics
@@ -585,14 +591,15 @@ class BaseTrainer:
             for metric in metrics_to_log:
                 metric_name = f"test/all/{metric}"
                 metric_value = getattr(metrics, metric)
-                self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+                test_metrics[metric_name] = float(metric_value)
                 metrics_str += f"{metric_name}: {metric_value:.3f} "
 
             # Compute F-Score Metric based on Precision and Recall
             metric_name = f"test/all/fscore"
             metric_value = 2 * metrics.mp * metrics.mr / (metrics.mp + metrics.mr)
-            self.pipe_logger.mlflow_client.log_metric_mlflow(metric_name, metric_value, epoch)
+            test_metrics[metric_name] = float(metric_value)
             metrics_str += f"{metric_name}: {metric_value:.3f} "
+            self._log_metrics_best_effort("final test metrics", test_metrics, epoch)
 
             # Log final metrics to log file
             logger.info(metrics_str)
@@ -654,9 +661,33 @@ class BaseTrainer:
             f for f in os.listdir(self.save_dir) if f.endswith((".png", ".jpg")) and f not in uploaded
         )
         logger.info(f"Logging {len(new_files)} new results images to MLFlow")
+        client = _mlflow_client(self)
+        if client is None:
+            return
         for file in new_files:
-            self.pipe_logger.mlflow_client.log_artifact(os.path.join(self.save_dir, file), RESULT_ARTIFACTS_DIR)
-            uploaded.add(file)
+            path = os.path.join(self.save_dir, file)
+            if _best_effort(self, f"upload result image {file}", client.log_artifact, path, RESULT_ARTIFACTS_DIR):
+                uploaded.add(file)  # a failed upload stays out so the next call retries it
+
+    def _log_metrics_best_effort(self, what, metrics, step):
+        """Log a dict of metrics to MLflow in one best-effort call."""
+        mlflow = _mlflow_cb.mlflow
+        if mlflow is None or not metrics:
+            return
+        _best_effort(self, what, lambda: mlflow.log_metrics(metrics, step=step))
+
+    def _ensure_best_model_uploaded(self):
+        """Upload the last best model if its best-effort upload failed. Raises after the patience runs out."""
+        pending = self._pending_best_ckpt
+        if pending is None:
+            return
+        client = _mlflow_client(self)
+        if client is None:
+            raise RuntimeError("No MLFlow client (pipe_logger.mlflow_client): the best model was never uploaded")
+        ckpt_cpu, backbone = pending
+        logger.info("Re-uploading the best model to MLFlow")
+        _fatal(self, "upload best model", client.log_pt_model_mlflow, ckpt_cpu, backbone)
+        self._pending_best_ckpt = None
 
     def save_model(self):
         """Save model checkpoints based on various conditions."""
@@ -708,11 +739,20 @@ class BaseTrainer:
         if self.best_fitness == self.fitness:
             torch.save(ckpt, self.best, pickle_module=pickle)
             # Log Model to MLFlow
-            logger.info(f"Logging model to MLFlow")
-            self.pipe_logger.mlflow_client.log_pt_model_mlflow(ckpt_cpu, self.args.model[:-3])
-            # Save Checkpoint to MLFlow
-            logger.info(f"Logging best checkpoint to MLFlow")
-            self.pipe_logger.mlflow_client.log_state_dict_mlflow(ckpt, "best")
+            client = _mlflow_client(self)
+            backbone = self.args.model[:-3]
+            if client is None:
+                # Without a client the registered model cannot be uploaded: _ensure_best_model_uploaded raises.
+                self._pending_best_ckpt = (ckpt_cpu, backbone)
+            else:
+                logger.info(f"Logging model to MLFlow")
+                if _best_effort(self, "upload best model", client.log_pt_model_mlflow, ckpt_cpu, backbone):
+                    self._pending_best_ckpt = None
+                else:
+                    self._pending_best_ckpt = (ckpt_cpu, backbone)  # a later best replaces it
+                # Save Checkpoint to MLFlow (best effort, never re-uploaded)
+                logger.info(f"Logging best checkpoint to MLFlow")
+                _best_effort(self, "upload best state_dict", client.log_state_dict_mlflow, ckpt, "best")
         if (self.epoch > 0) and (self.save_period > 0) and (self.epoch % self.save_period == 0):
             torch.save(ckpt, self.wdir / f'epoch{self.epoch}.pt', pickle_module=pickle)
 
